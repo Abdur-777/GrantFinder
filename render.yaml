@@ -1,14 +1,24 @@
 services:
   - type: web
-    name: grantfinder
+    name: grantfinder-vic
     env: python
     plan: free
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: |
+      python -V
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: ADMIN_PIN
-        value: "4242"
-      - key: STRIPE_CHECKOUT_URL
-        value: "https://buy.stripe.com/test_XXXX"
+
+  - type: cron
+    name: grantfinder-vic-daily
+    env: python
+    schedule: "0 18 * * *"   # daily 6pm UTC
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: python refresh.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
