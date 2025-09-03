@@ -1,7 +1,9 @@
-# app.py — GrantFinder VIC (Open Demo)
+# app.py — GrantFinder VIC (Open Demo, UTC-safe 24h badge)
 # - Click "Refresh" to scrape curated VIC sources
 # - Browse, filter, export CSV
 # - Sorts by nearest deadline (unknowns last)
+# - Shows "new in last 24h" using timezone-aware UTC timestamps
+
 import os, time, hashlib
 from datetime import datetime, date
 from typing import List, Dict, Optional
@@ -85,7 +87,7 @@ def parse_generic(html: str, base_url: str) -> List[Dict]:
             continue
         link = href if href.startswith("http") else requests.compat.urljoin(base_url, href)
         desc = near_text(a, "p") or near_text(a, "li")
-        # MVP: leave amount/deadline as empty text; councils can check details on source pages
+        # MVP: leave amount/deadline blank; details live on source pages
         out.append({
             "title": title,
             "description": desc,
@@ -110,7 +112,7 @@ def scrape_sources(sources: List[str]) -> List[Dict]:
         html = safe_get(src)
         results.extend(parse_generic(html, src))
         time.sleep(0.3)
-    # dedupe again (across pages)
+    # dedupe across pages
     seen, keep = set(), []
     for r in results:
         L = r.get("link","")
@@ -132,6 +134,7 @@ def merge_into_csv(new_rows: List[Dict]) -> int:
             continue
         item = r.copy()
         item["id"] = row_id(item)
+        # store ISO string; treat as UTC (no tz offset stored)
         item["created_at"] = datetime.utcnow().isoformat()
         iso = normalize_date_str(item.get("deadline"))
         item["deadline"] = iso or (item.get("deadline") or "")
@@ -160,11 +163,15 @@ if df.empty:
     st.info("No grants yet. Click **Refresh grants** above to load data.")
 else:
     last = df["created_at"].max()
-    # New in last 24h
+
+    # ✅ New in last 24h (UTC-safe)
     if "created_at" in df.columns:
-        df["_created_dt"] = pd.to_datetime(df["created_at"], errors="coerce")
-        new_24h = df[df["_created_dt"] >= (pd.Timestamp.utcnow() - pd.Timedelta(days=1))]
-        st.caption(f"🆕 {len(new_24h)} new in last 24h • Total {len(df)} • Last refresh: {last}")
+        # parse as timezone-aware UTC
+        df["_created_dt"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+        now_utc = pd.Timestamp.now(tz="UTC")
+        yesterday = now_utc - pd.Timedelta(days=1)
+        new_24h = df[df["_created_dt"] >= yesterday]
+        st.caption(f"🆕 {len(new_24h)} new in the last 24h • Total {len(df)} • Last refresh: {last}")
 
 # Filters
 st.subheader("🔎 Browse & filter")
