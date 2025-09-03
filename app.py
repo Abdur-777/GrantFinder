@@ -1,10 +1,11 @@
-# app.py — GrantFinder VIC (Open Demo, UTC-safe 24h badge)
-# - Click "Refresh" to scrape curated VIC sources
-# - Browse, filter, export CSV
-# - Sorts by nearest deadline (unknowns last)
-# - Shows "new in last 24h" using timezone-aware UTC timestamps
+# app.py — GrantFinder VIC (Open Demo, hourly-refresh friendly)
+# - Uses DATA_DIR env var (shared disk) for persistence
+# - One-click Refresh, VIC-focused sources
+# - UTC-safe "new in last 24h" badge
+# - Sort by nearest deadline (unknowns last)
+# - Export current view to CSV
 
-import os, time, hashlib
+import os, time, hashlib, tempfile
 from datetime import datetime, date
 from typing import List, Dict, Optional
 
@@ -16,32 +17,57 @@ import streamlit as st
 
 from sources_vic import VIC_SOURCES
 
-APP_NAME = "GrantFinder – Victoria (Open Demo)"
-DATA_DIR = "data"
-CSV_PATH = os.path.join(DATA_DIR, "grants.csv")
-os.makedirs(DATA_DIR, exist_ok=True)
+APP_NAME = "GrantFinder — Victoria (Open Demo)"
 
-# --------- Storage helpers ---------
+# ---------- Storage paths (shared disk-ready) ----------
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+CSV_PATH = os.path.join(DATA_DIR, "grants.csv")
+
+# ---------- CSV helpers (atomic writes, resilient reads) ----------
+BASE_COLUMNS = ["id","title","description","amount","deadline","link","source","created_at","summary"]
+
+def save_df_atomic(df: pd.DataFrame, path: str):
+    """Write CSV atomically to avoid partial reads during worker writes."""
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="grants_", suffix=".csv", dir=DATA_DIR)
+    os.close(tmp_fd)
+    try:
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, path)  # atomic on POSIX
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+
 def ensure_csv(path: str = CSV_PATH):
     if not os.path.exists(path):
-        cols = ["id","title","description","amount","deadline","link","source","created_at","summary"]
-        pd.DataFrame(columns=cols).to_csv(path, index=False)
+        save_df_atomic(pd.DataFrame(columns=BASE_COLUMNS), path)
 
-def load_df() -> pd.DataFrame:
+def load_df(retries: int = 3, delay: float = 0.2) -> pd.DataFrame:
     ensure_csv()
-    try:
-        df = pd.read_csv(CSV_PATH)
-    except Exception:
-        df = pd.DataFrame(columns=["id","title","description","amount","deadline","link","source","created_at","summary"])
-    for c in ["id","title","description","amount","deadline","link","source","created_at","summary"]:
+    for i in range(retries):
+        try:
+            df = pd.read_csv(CSV_PATH)
+            break
+        except Exception:
+            if i == retries - 1:
+                df = pd.DataFrame(columns=BASE_COLUMNS)
+            else:
+                time.sleep(delay)
+    # normalize columns
+    for c in BASE_COLUMNS:
         if c not in df.columns:
             df[c] = ""
     return df
 
 def save_df(df: pd.DataFrame):
-    df.to_csv(CSV_PATH, index=False)
+    # keep column order tidy
+    for c in BASE_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    save_df_atomic(df[BASE_COLUMNS], CSV_PATH)
 
-# --------- Utilities ---------
+# ---------- Utilities ----------
 def sha16(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -70,7 +96,7 @@ def near_text(el: BeautifulSoup, selector: str) -> str:
     n = el.find_next(selector)
     return (n.get_text(" ", strip=True) if n else "")[:600]
 
-# --------- Scraper (generic heuristics) ---------
+# ---------- Scraper (generic heuristics) ----------
 KEYWORDS = ("grant", "fund", "funding", "program", "round", "apply")
 
 def parse_generic(html: str, base_url: str) -> List[Dict]:
@@ -87,7 +113,6 @@ def parse_generic(html: str, base_url: str) -> List[Dict]:
             continue
         link = href if href.startswith("http") else requests.compat.urljoin(base_url, href)
         desc = near_text(a, "p") or near_text(a, "li")
-        # MVP: leave amount/deadline blank; details live on source pages
         out.append({
             "title": title,
             "description": desc,
@@ -111,7 +136,7 @@ def scrape_sources(sources: List[str]) -> List[Dict]:
     for src in sources:
         html = safe_get(src)
         results.extend(parse_generic(html, src))
-        time.sleep(0.3)
+        time.sleep(0.3)  # be polite
     # dedupe across pages
     seen, keep = set(), []
     for r in results:
@@ -121,7 +146,7 @@ def scrape_sources(sources: List[str]) -> List[Dict]:
             keep.append(r)
     return keep
 
-# --------- Merge logic ---------
+# ---------- Merge logic ----------
 def merge_into_csv(new_rows: List[Dict]) -> int:
     if not new_rows:
         return 0
@@ -134,8 +159,8 @@ def merge_into_csv(new_rows: List[Dict]) -> int:
             continue
         item = r.copy()
         item["id"] = row_id(item)
-        # store ISO string; treat as UTC (no tz offset stored)
-        item["created_at"] = datetime.utcnow().isoformat()
+        # ISO UTC with Z suffix (parses nicely with utc=True)
+        item["created_at"] = datetime.utcnow().isoformat() + "Z"
         iso = normalize_date_str(item.get("deadline"))
         item["deadline"] = iso or (item.get("deadline") or "")
         to_add.append(item)
@@ -145,12 +170,11 @@ def merge_into_csv(new_rows: List[Dict]) -> int:
     save_df(df2)
     return len(to_add)
 
-# --------- UI ---------
+# ---------- UI ----------
 st.set_page_config(page_title=APP_NAME, page_icon="🏛️", layout="wide")
 st.title("🏛️ GrantFinder — Victoria")
-st.caption("🎯 Focus: Victoria (Australia) grant sources")
+st.caption("🎯 Focus: Victoria (Australia) grant sources • Data stored at: " + DATA_DIR)
 
-# Refresh button (no auth)
 if st.button("🔄 Refresh grants"):
     with st.spinner("Scraping curated VIC sources…"):
         added = merge_into_csv(scrape_sources(VIC_SOURCES))
@@ -163,17 +187,15 @@ if df.empty:
     st.info("No grants yet. Click **Refresh grants** above to load data.")
 else:
     last = df["created_at"].max()
-
-    # ✅ New in last 24h (UTC-safe)
+    # UTC-safe "new in last 24h"
     if "created_at" in df.columns:
-        # parse as timezone-aware UTC
         df["_created_dt"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
         now_utc = pd.Timestamp.now(tz="UTC")
         yesterday = now_utc - pd.Timedelta(days=1)
         new_24h = df[df["_created_dt"] >= yesterday]
         st.caption(f"🆕 {len(new_24h)} new in the last 24h • Total {len(df)} • Last refresh: {last}")
 
-# Filters
+# -------- Filters --------
 st.subheader("🔎 Browse & filter")
 c1, c2, c3 = st.columns([2,1,1])
 with c1:
@@ -185,7 +207,7 @@ with c3:
 
 filtered = df.copy()
 if not filtered.empty:
-    # Parse deadlines for sorting / filter
+    # Parse deadlines for sorting/filter
     filtered["deadline_iso"] = filtered["deadline"].apply(normalize_date_str)
     filtered["_deadline_dt"] = pd.to_datetime(filtered["deadline_iso"], errors="coerce")
 
@@ -207,13 +229,14 @@ if not filtered.empty:
     if isinstance(deadline_before, date):
         filtered = filtered[(filtered["_deadline_dt"].notna()) & (filtered["_deadline_dt"].dt.date <= deadline_before)]
 
-    # Sort: nearest deadline first; unknowns last, tie-break by created_at (newer first)
+    # Sort: nearest deadline first, newer created_at first; unknown deadlines last
     filtered = filtered.sort_values(by=["_deadline_dt", "created_at"], ascending=[True, False], na_position="last").copy()
 
-    # Tidy presentation
+    # Presentation
     def tidy_desc(s: str, n: int = 160) -> str:
         s = (s or "").strip().replace("\n"," ")
         return (s[:n] + "…") if len(s) > n else s
+
     filtered["description_preview"] = filtered["description"].fillna("").apply(tidy_desc)
     filtered["title_link"] = filtered["link"].fillna("")
 
@@ -239,6 +262,7 @@ if not filtered.empty:
         }
     )
 
+    # Export current view
     export_cols = ["title","amount","deadline","source","link","description","summary"]
     filtered["deadline"] = filtered["deadline_iso"]
     csv_bytes = filtered[export_cols].to_csv(index=False).encode("utf-8")
@@ -249,4 +273,4 @@ else:
                        file_name="grants_vic_export.csv", mime="text/csv")
 
 st.divider()
-st.caption("ⓘ MVP demo. Data is best-effort from public pages; verify details on source sites before applying.")
+st.caption("ⓘ MVP demo. Best-effort extraction from public pages; verify details on source sites before applying.")
