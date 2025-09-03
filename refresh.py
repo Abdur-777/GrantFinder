@@ -1,14 +1,17 @@
-# refresh.py — Master crawl + per-council split (15 councils)
+# refresh.py — Master crawl + per-council split, with FOLLOW_DETAILS + AI summaries
 # ENV:
-#   DATA_DIR=/var/data/grants          (shared disk)
+#   DATA_DIR=/var/data/grants
 #   TENANTS_FILE=tenants.yaml
-#   INCLUDE_STATEWIDE_IN_EACH=1        (include 'vic' rows in every council feed)
-#   REFRESH_INTERVAL_SECONDS=3600      (used only by your worker loop)
+#   INCLUDE_STATEWIDE_IN_EACH=1
+#   FOLLOW_DETAILS=25
+#   SUMMARIZE=1
+#   OPENAI_API_KEY=sk-...
 
-import os, time, hashlib, tempfile
+import os, time, re, hashlib, tempfile
 from datetime import date, datetime
 from typing import List, Dict, Optional
 from pathlib import Path
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +22,10 @@ from urllib.parse import urljoin
 DATA_ROOT = os.getenv("DATA_DIR", "data")
 TENANTS_FILE = os.getenv("TENANTS_FILE", "tenants.yaml")
 INCLUDE_STATEWIDE_IN_EACH = os.getenv("INCLUDE_STATEWIDE_IN_EACH", "1") == "1"
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+SUMMARIZE = os.getenv("SUMMARIZE", "0") == "1"
+FOLLOW_DETAILS = int(os.getenv("FOLLOW_DETAILS", "25"))
 
 MASTER_DIR = Path(DATA_ROOT) / "master"
 MASTER_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,8 +57,7 @@ def ensure_df(path: str, columns: List[str]) -> pd.DataFrame:
     except Exception:
         df = pd.DataFrame(columns=columns)
     for c in columns:
-        if c not in df.columns:
-            df[c] = ""
+        if c not in df.columns: df[c] = ""
     return df
 
 def save_master(df: pd.DataFrame):
@@ -85,17 +91,82 @@ def safe_get(url: str, timeout=20) -> Optional[str]:
         pass
     return None
 
+def first_text(soup: BeautifulSoup, selectors: list[str]) -> str:
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            t = el.get_text(" ", strip=True)
+            if t:
+                return t
+    return ""
+
+def meta_content(soup: BeautifulSoup) -> str:
+    for name in ["description", "og:description"]:
+        el = soup.select_one(f'meta[name="{name}"], meta[property="{name}"]')
+        if el and el.get("content"):
+            return el.get("content").strip()
+    return ""
+
+AMOUNT_RX = re.compile(r"\$\s?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\$\s?\d+[KkMm]?", re.I)
+DEADLINE_RX = re.compile(r"(deadline|close[s]?|closing date|apply by)\s*[:\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", re.I)
+
+def extract_amount(text: str) -> str:
+    m = AMOUNT_RX.search(text or "")
+    return m.group(0) if m else ""
+
+def extract_deadline(text: str) -> str:
+    m = DEADLINE_RX.search(text or "")
+    return m.group(0) if m else ""
+
+def fetch_detail(link: str) -> dict:
+    html = safe_get(link)
+    if not html:
+        return {}
+    s = BeautifulSoup(html, "html.parser")
+    title = first_text(s, ["h1", "h2"]) or ""
+    meta = meta_content(s)
+    desc = meta or first_text(s, ["article p", "main p", ".content p", ".rich-text p", "p"])
+    gist = f"{title} {desc}"
+    return {
+        "title": (title or "").strip(),
+        "description": (desc or "").strip(),
+        "amount": extract_amount(gist),
+        "deadline": extract_deadline(gist),
+    }
+
+def ai_summarize(title: str, description: str) -> str:
+    if not (OPENAI_API_KEY and SUMMARIZE):
+        return ""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        prompt = (
+            "Summarize this grant in 2 short sentences for council officers. "
+            "Include who it’s for and the key benefit. Avoid fluff.\n\n"
+            f"Title: {title}\nDescription: {description[:1500]}"
+        )
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2,
+            max_tokens=140,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+KEYWORDS = ("grant", "fund", "funding", "program", "round", "apply")
+
 def near_text(el: BeautifulSoup, selector: str) -> str:
     n = el.find_next(selector)
     return (n.get_text(" ", strip=True) if n else "")[:600]
-
-KEYWORDS = ("grant", "fund", "funding", "program", "round", "apply")
 
 def parse_generic(html: str, base_url: str) -> List[Dict]:
     if not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
-    out = []
+    candidates = []
+
     for a in soup.select("a"):
         title = (a.get_text() or "").strip()
         href = (a.get("href") or "").strip()
@@ -106,7 +177,7 @@ def parse_generic(html: str, base_url: str) -> List[Dict]:
             continue
         link = href if href.startswith("http") else urljoin(base_url, href)
         desc = near_text(a, "p") or near_text(a, "li")
-        out.append({
+        candidates.append({
             "title": title,
             "description": desc,
             "amount": "",
@@ -115,13 +186,29 @@ def parse_generic(html: str, base_url: str) -> List[Dict]:
             "source": base_url,
             "summary": "",
         })
+
     # de-dup by link
-    seen, keep = set(), []
-    for r in out:
-        L = r.get("link","")
-        if L and L not in seen:
-            seen.add(L); keep.append(r)
-    return keep
+    seen, rows = set(), []
+    for r in candidates:
+        L = r["link"]
+        if L not in seen:
+            seen.add(L); rows.append(r)
+
+    # follow up to FOLLOW_DETAILS
+    for r in rows[:max(0, FOLLOW_DETAILS)]:
+        try:
+            detail = fetch_detail(r["link"])
+            if detail.get("title"): r["title"] = detail["title"]
+            if detail.get("description"): r["description"] = detail["description"]
+            if detail.get("amount"): r["amount"] = detail["amount"]
+            if not r["deadline"] and detail.get("deadline"): r["deadline"] = detail["deadline"]
+            summ = ai_summarize(r["title"], r["description"])
+            if summ: r["summary"] = summ
+            time.sleep(0.2)
+        except Exception:
+            pass
+
+    return rows
 
 def scrape_sources(sources: List[str]) -> List[Dict]:
     results = []
@@ -140,8 +227,7 @@ def scrape_sources(sources: List[str]) -> List[Dict]:
 # ----------------- Merge logic -----------------
 def merge_into_master(new_rows: List[Dict]) -> int:
     """Merge rows into master CSV (dedupe by link)."""
-    if not new_rows:
-        return 0
+    if not new_rows: return 0
     df = ensure_df(MASTER_CSV, MASTER_COLUMNS)
     existing_links = set(df["link"].fillna("").astype(str).tolist()) if not df.empty else set()
     to_add = []
@@ -154,12 +240,12 @@ def merge_into_master(new_rows: List[Dict]) -> int:
         item["created_at"] = datetime.utcnow().isoformat() + "Z"
         iso = normalize_date_str(item.get("deadline"))
         item["deadline"] = iso or (item.get("deadline") or "")
-        # make sure council_slug exists
         if "council_slug" not in item:
             item["council_slug"] = "vic"
+        # ensure summary present (might be empty)
+        item["summary"] = item.get("summary","")
         to_add.append(item)
-    if not to_add:
-        return 0
+    if not to_add: return 0
     df2 = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True) if not df.empty else pd.DataFrame(to_add)
     save_master(df2)
     return len(to_add)
@@ -178,21 +264,20 @@ def expire_old_rows(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------- Main: master crawl → split -----------------
 if __name__ == "__main__":
     start = datetime.utcnow().isoformat() + "Z"
-    print(f"[{start}] Refresh start • data_root={DATA_ROOT} • tenants_file={TENANTS_FILE}")
+    print(f"[{start}] Refresh start • data_root={DATA_ROOT} • tenants_file={TENANTS_FILE} • FOLLOW_DETAILS={FOLLOW_DETAILS} • SUMMARIZE={'on' if SUMMARIZE else 'off'}")
     with open(TENANTS_FILE, "r") as f:
         TENANTS = yaml.safe_load(f) or {}
     slugs = list(TENANTS.keys())
     print("Tenants:", slugs)
 
-    # 1) Statewide once
     total_added = 0
+
+    # 1) Statewide once
     if "vic" in TENANTS:
         sw_sources = TENANTS["vic"].get("sources", [])
         rows = scrape_sources(sw_sources)
-        for r in rows:
-            r["council_slug"] = "vic"
-        added = merge_into_master(rows)
-        total_added += added
+        for r in rows: r["council_slug"] = "vic"
+        added = merge_into_master(rows); total_added += added
         print(f"[vic] added {added}")
     else:
         print("[vic] no statewide tenant found; skipping.")
@@ -204,10 +289,8 @@ if __name__ == "__main__":
         sources = cfg.get("sources", [])
         try:
             rows = scrape_sources(sources)
-            for r in rows:
-                r["council_slug"] = slug
-            added = merge_into_master(rows)
-            total_added += added
+            for r in rows: r["council_slug"] = slug
+            added = merge_into_master(rows); total_added += added
             print(f"[{slug}] added {added}")
         except Exception as e:
             print(f"[{slug}] ERROR:", repr(e))
@@ -225,7 +308,6 @@ if __name__ == "__main__":
                 council_df = master[master["council_slug"] == slug].copy()
                 if INCLUDE_STATEWIDE_IN_EACH:
                     council_df = pd.concat([council_df, master[master["council_slug"] == "vic"]], ignore_index=True)
-                # dedupe by link
                 council_df = council_df.drop_duplicates(subset=["link"], keep="last")
 
             before = len(council_df)
