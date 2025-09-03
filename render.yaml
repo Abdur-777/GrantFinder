@@ -1,8 +1,9 @@
 services:
+  # --- Web UI (Streamlit) ---
   - type: web
     name: grantfinder-vic
     env: python
-    plan: free
+    plan: starter                     # disk requires a paid plan
     buildCommand: |
       python -V
       pip install --upgrade pip setuptools wheel
@@ -11,14 +12,29 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data/grants       # <-- app should write here
+    disk:
+      name: grants-data
+      mountPath: /var/data            # shared mount for CSV
+      sizeGB: 1
 
-  - type: cron
-    name: grantfinder-vic-daily
+  # --- Hourly refresher (shared disk) ---
+  - type: worker
+    name: grantfinder-vic-hourly
     env: python
-    schedule: "0 18 * * *"   # daily 6pm UTC
+    plan: starter                     # disk requires a paid plan
     buildCommand: |
+      pip install --upgrade pip setuptools wheel
       pip install -r requirements.txt
-    startCommand: python refresh.py
+    # Run the refresh script every hour forever
+    startCommand: bash -lc 'while true; do python refresh.py; sleep 3600; done'
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data/grants       # same path as web
+    disk:
+      name: grants-data               # same disk name = shared storage
+      mountPath: /var/data
+      sizeGB: 1
