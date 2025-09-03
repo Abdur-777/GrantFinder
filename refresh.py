@@ -1,8 +1,5 @@
-# refresh.py — Hourly/Nightly refresher for VIC grants
-# - Uses the same DATA_DIR as app.py (shared disk)
-# - Scrapes curated sources, merges new rows
-# - Expires rows with past deadlines (when a date can be parsed)
-# - Prints simple logs (visible in Render worker logs)
+# refresh.py — Hourly refresher for all tenants (5 councils)
+# Reads tenants.yaml, refreshes each tenant's sources, writes to DATA_DIR/<slug>/grants.csv
 
 import os, time, hashlib, tempfile
 from datetime import date, datetime
@@ -12,18 +9,20 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparse
+import yaml
+from pathlib import Path
 
-from sources_vic import VIC_SOURCES
+DATA_ROOT = os.getenv("DATA_DIR", "data")
+TENANTS_FILE = os.getenv("TENANTS_FILE", "tenants.yaml")
 
-# ---------- Storage paths ----------
-DATA_DIR = os.getenv("DATA_DIR", "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-CSV_PATH = os.path.join(DATA_DIR, "grants.csv")
+with open(TENANTS_FILE, "r") as f:
+    TENANTS = yaml.safe_load(f) or {}
+
 BASE_COLUMNS = ["id","title","description","amount","deadline","link","source","created_at","summary"]
 
-# ---------- CSV helpers ----------
+# ---- shared helpers (same logic as app.py) ----
 def save_df_atomic(df: pd.DataFrame, path: str):
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix="grants_", suffix=".csv", dir=DATA_DIR)
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="grants_", suffix=".csv", dir=os.path.dirname(path))
     os.close(tmp_fd)
     try:
         df.to_csv(tmp_path, index=False)
@@ -33,15 +32,15 @@ def save_df_atomic(df: pd.DataFrame, path: str):
             try: os.remove(tmp_path)
             except Exception: pass
 
-def ensure_csv(path: str = CSV_PATH):
+def ensure_csv(path: str):
     if not os.path.exists(path):
         save_df_atomic(pd.DataFrame(columns=BASE_COLUMNS), path)
 
-def load_df(retries: int = 3, delay: float = 0.2) -> pd.DataFrame:
-    ensure_csv()
+def load_df(path: str, retries: int = 3, delay: float = 0.2) -> pd.DataFrame:
+    ensure_csv(path)
     for i in range(retries):
         try:
-            df = pd.read_csv(CSV_PATH)
+            df = pd.read_csv(path)
             break
         except Exception:
             if i == retries - 1:
@@ -49,17 +48,14 @@ def load_df(retries: int = 3, delay: float = 0.2) -> pd.DataFrame:
             else:
                 time.sleep(delay)
     for c in BASE_COLUMNS:
-        if c not in df.columns:
-            df[c] = ""
+        if c not in df.columns: df[c] = ""
     return df
 
-def save_df(df: pd.DataFrame):
+def save_df(path: str, df: pd.DataFrame):
     for c in BASE_COLUMNS:
-        if c not in df.columns:
-            df[c] = ""
-    save_df_atomic(df[BASE_COLUMNS], CSV_PATH)
+        if c not in df.columns: df[c] = ""
+    save_df_atomic(df[BASE_COLUMNS], path)
 
-# ---------- Utils & scraper ----------
 def sha16(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -67,8 +63,7 @@ def row_id(r: Dict) -> str:
     return sha16(f"{r.get('title','')}|{r.get('link','')}")
 
 def normalize_date_str(s: Optional[str]) -> Optional[str]:
-    if not s or str(s).strip() == "":
-        return None
+    if not s or str(s).strip() == "": return None
     try:
         dt = dateparse.parse(str(s), dayfirst=True, fuzzy=True)
         return dt.date().isoformat()
@@ -78,8 +73,7 @@ def normalize_date_str(s: Optional[str]) -> Optional[str]:
 def safe_get(url: str, timeout=20) -> Optional[str]:
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "GrantFinderBot/1.0"})
-        if r.ok:
-            return r.text
+        if r.ok: return r.text
     except Exception:
         pass
     return None
@@ -91,35 +85,23 @@ def near_text(el: BeautifulSoup, selector: str) -> str:
 KEYWORDS = ("grant", "fund", "funding", "program", "round", "apply")
 
 def parse_generic(html: str, base_url: str) -> List[Dict]:
-    if not html:
-        return []
+    if not html: return []
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for a in soup.select("a"):
         title = (a.get_text() or "").strip()
         href = (a.get("href") or "").strip()
-        if not title or not href:
-            continue
-        if not any(k in title.lower() for k in KEYWORDS):
-            continue
+        if not title or not href: continue
+        if not any(k in title.lower() for k in KEYWORDS): continue
         link = href if href.startswith("http") else requests.compat.urljoin(base_url, href)
         desc = near_text(a, "p") or near_text(a, "li")
-        out.append({
-            "title": title,
-            "description": desc,
-            "amount": "",
-            "deadline": "",
-            "link": link,
-            "source": base_url,
-            "summary": "",
-        })
-    # dedupe by link
+        out.append({"title": title, "description": desc, "amount": "", "deadline": "",
+                    "link": link, "source": base_url, "summary": ""})
     seen, keep = set(), []
     for r in out:
         L = r.get("link","")
         if L and L not in seen:
-            seen.add(L)
-            keep.append(r)
+            seen.add(L); keep.append(r)
     return keep
 
 def scrape_sources(sources: List[str]) -> List[Dict]:
@@ -128,63 +110,61 @@ def scrape_sources(sources: List[str]) -> List[Dict]:
         html = safe_get(src)
         results.extend(parse_generic(html, src))
         time.sleep(0.3)
-    # dedupe across pages
     seen, keep = set(), []
     for r in results:
         L = r.get("link","")
         if L and L not in seen:
-            seen.add(L)
-            keep.append(r)
+            seen.add(L); keep.append(r)
     return keep
 
-# ---------- Merge & expiry ----------
-def merge_into_csv(new_rows: List[Dict]) -> int:
-    if not new_rows:
-        return 0
-    df = load_df()
+def merge_into_csv(path: str, new_rows: List[Dict]) -> int:
+    if not new_rows: return 0
+    df = load_df(path)
     existing_links = set(df["link"].fillna("").astype(str).tolist()) if not df.empty else set()
     to_add = []
     for r in new_rows:
         link = r.get("link","")
-        if not link or link in existing_links:
-            continue
+        if not link or link in existing_links: continue
         item = r.copy()
         item["id"] = row_id(item)
         item["created_at"] = datetime.utcnow().isoformat() + "Z"
         iso = normalize_date_str(item.get("deadline"))
         item["deadline"] = iso or (item.get("deadline") or "")
         to_add.append(item)
-    if not to_add:
-        return 0
+    if not to_add: return 0
     df2 = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True) if not df.empty else pd.DataFrame(to_add)
-    save_df(df2)
+    save_df(path, df2)
     return len(to_add)
 
 def expire_old_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep rows with unknown deadline or deadline >= today."""
-    if df.empty or "deadline" not in df.columns:
-        return df
+    if df.empty or "deadline" not in df.columns: return df
     df = df.copy()
     df["deadline_iso"] = df["deadline"].apply(normalize_date_str)
     df["_deadline_dt"] = pd.to_datetime(df["deadline_iso"], errors="coerce")
     today = pd.to_datetime(date.today())
-    keep_mask = df["_deadline_dt"].isna() | (df["_deadline_dt"] >= today)
-    return df[keep_mask].drop(columns=["_deadline_dt"], errors="ignore")
+    keep = df["_deadline_dt"].isna() | (df["_deadline_dt"] >= today)
+    return df[keep].drop(columns=["_deadline_dt"], errors="ignore")
 
-# ---------- Main ----------
+# ---- process all tenants ----
 if __name__ == "__main__":
     start = datetime.utcnow().isoformat() + "Z"
-    print(f"[{start}] Refresh start • sources={len(VIC_SOURCES)} • data_dir={DATA_DIR}")
-    try:
-        rows = scrape_sources(VIC_SOURCES)
-        added = merge_into_csv(rows)
-        print(f"Scraped & merged. Added {added} new rows.")
-        df = load_df()
-        before = len(df)
-        df2 = expire_old_rows(df)
-        if len(df2) != before:
-            save_df(df2)
-            print(f"Expired {before - len(df2)} rows (past deadline).")
-        print(f"Done. Total rows: {len(df2)}")
-    except Exception as e:
-        print("ERROR during refresh:", repr(e))
+    print(f"[{start}] Refresh start • tenants={list(TENANTS.keys())} • data_root={DATA_ROOT}")
+    for slug, cfg in TENANTS.items():
+        sources = cfg.get("sources", [])
+        tdir = Path(DATA_ROOT) / slug
+        tdir.mkdir(parents=True, exist_ok=True)
+        csv_path = str(tdir / "grants.csv")
+
+        try:
+            rows = scrape_sources(sources)
+            added = merge_into_csv(csv_path, rows)
+            print(f"[{slug}] added {added}")
+            df = load_df(csv_path)
+            before = len(df)
+            df2 = expire_old_rows(df)
+            if len(df2) != before:
+                save_df(csv_path, df2)
+                print(f"[{slug}] expired {before - len(df2)}")
+            print(f"[{slug}] total {len(df2)}")
+        except Exception as e:
+            print(f"[{slug}] ERROR:", repr(e))
