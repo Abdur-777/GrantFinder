@@ -1,0 +1,39 @@
+wyndham:
+  name: "Wyndham City Council"
+  color: "#1764a7"
+  sources:
+    - https://www.wyndham.vic.gov.au/about-council/grants-funding
+    - https://business.vic.gov.au/grants-and-programs
+    - https://www.vic.gov.au/grants
+
+melton:
+  name: "City of Melton"
+  color: "#cc2e52"
+  sources:
+    - https://www.melton.vic.gov.au/            # TODO: replace with Melton’s grants page URL
+    - https://business.vic.gov.au/grants-and-programs
+    - https://www.vic.gov.au/grants
+
+brimbank:
+  name: "Brimbank City Council"
+  color: "#EE7F00"
+  sources:
+    - https://www.brimbank.vic.gov.au/community/community-grants
+    - https://business.vic.gov.au/grants-and-programs
+    - https://www.vic.gov.au/grants
+
+hobsonsbay:
+  name: "Hobsons Bay City Council"
+  color: "#1a7f37"
+  sources:
+    - https://www.hobsonsbay.vic.gov.au/Community/Grants
+    - https://business.vic.gov.au/grants-and-programs
+    - https://www.vic.gov.au/grants
+
+melbourne:
+  name: "City of Melbourne"
+  color: "#0b7a70"
+  sources:
+    - https://www.melbourne.vic.gov.au/community/funding/Pages/grants.aspx
+    - https://business.vic.gov.au/grants-and-programs
+    - https://www.vic.gov.au/grants
