@@ -1,398 +1,365 @@
-# app.py — GrantFinder VIC (Multi-tenant, FOLLOW_DETAILS + AI summaries)
-# - Tenants from tenants.yaml (e.g., wyndham, melton, …)
-# - Per-tenant storage at DATA_DIR/<slug>/grants.csv
-# - Follows detail pages (FOLLOW_DETAILS) to enrich title/description/amount/deadline
-# - Optional AI summaries (SUMMARIZE=1 + OPENAI_API_KEY)
-# - UTC-safe “new in last 24h” badge
-# - Clean table (no duplicate column names)
-
-import os, time, re, hashlib, tempfile
-from datetime import datetime, date
-from typing import List, Dict, Optional
+# app.py
+import os
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+from typing import Dict, List, Optional
 
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from dateutil import parser as dateparse
 import streamlit as st
+
+# ---------- Config & Clients ----------
+from supabase import create_client
 import yaml
-from urllib.parse import urljoin
 
-APP_NAME = "GrantFinder — Victoria"
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Feature toggles ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-SUMMARIZE = os.getenv("SUMMARIZE", "0") == "1"
-FOLLOW_DETAILS = int(os.getenv("FOLLOW_DETAILS", "25"))  # detail pages per source
-
-# ---------- Tenant loading ----------
-DATA_ROOT = os.getenv("DATA_DIR", "data")
 TENANTS_FILE = os.getenv("TENANTS_FILE", "tenants.yaml")
+INCLUDE_STATEWIDE_IN_EACH = os.getenv("INCLUDE_STATEWIDE_IN_EACH", "1") == "1"
+STATEWIDE_SLUG = os.getenv("STATEWIDE_SLUG", "vic")
+AUTO_REFRESH_MAX_AGE_MIN = int(os.getenv("AUTO_REFRESH_MAX_AGE_MIN", "60"))
+CRON_TOKEN = os.getenv("CRON_TOKEN", "")
+SUMMARIZE = os.getenv("SUMMARIZE", "0") == "1"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-FALLBACK_TENANTS = {
-    "vic": {
-        "name": "Victoria – Statewide",
-        "color": "#333333",
-        "sources": [
-            "https://www.vic.gov.au/grants",
-            "https://business.vic.gov.au/grants-and-programs",
-            "https://www.grants.gov.au/GO/list",
-        ],
-    }
-}
-try:
-    with open(TENANTS_FILE, "r") as f:
-        TENANTS = yaml.safe_load(f) or FALLBACK_TENANTS
-except Exception:
-    TENANTS = FALLBACK_TENANTS
-
-# Robust query param read across Streamlit versions
-try:
-    qp = st.query_params
-    slug = qp.get("c")
-    if isinstance(slug, list): slug = slug[0]
-except Exception:
-    slug = st.experimental_get_query_params().get("c", [None])[0]
-
-if not slug or slug not in TENANTS:
-    slug = next(iter(TENANTS.keys()))
-
-tenant = TENANTS[slug]
-TENANT_NAME = tenant.get("name", slug.capitalize())
-THEME_COLOR = tenant.get("color", "#222")
-SOURCES = tenant.get("sources", [])
-
-TENANT_DIR = os.path.join(DATA_ROOT, slug)
-os.makedirs(TENANT_DIR, exist_ok=True)
-
-CSV_PATH = os.path.join(TENANT_DIR, "grants.csv")  # per-tenant CSV
-BASE_COLUMNS = ["id","title","description","amount","deadline","link","source","created_at","summary"]
-
-# ---------- CSV helpers (atomic writes) ----------
-def save_df_atomic(df: pd.DataFrame, path: str):
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix="grants_", suffix=".csv", dir=os.path.dirname(path))
-    os.close(tmp_fd)
+# ---------- Utils ----------
+def load_tenants() -> Dict[str, dict]:
     try:
-        for c in BASE_COLUMNS:
-            if c not in df.columns:
-                df[c] = ""
-        df[BASE_COLUMNS].to_csv(tmp_path, index=False)
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except Exception: pass
+        with open(TENANTS_FILE, "r") as f:
+            data = yaml.safe_load(f) or {}
+            return data
+    except Exception:
+        # Minimal fallback if tenants file missing
+        return {
+            STATEWIDE_SLUG: {
+                "name": "Victoria — Statewide",
+                "sources": [
+                    "https://www.vic.gov.au/grants",
+                    "https://business.vic.gov.au/grants-and-programs",
+                    "https://www.grants.gov.au/GO/list",
+                ],
+            }
+        }
 
-def ensure_csv():
-    if not os.path.exists(CSV_PATH):
-        save_df_atomic(pd.DataFrame(columns=BASE_COLUMNS), CSV_PATH)
+TENANTS = load_tenants()
 
-def load_df(retries: int = 3, delay: float = 0.2) -> pd.DataFrame:
-    ensure_csv()
-    for i in range(retries):
-        try:
-            df = pd.read_csv(CSV_PATH)
-            break
-        except Exception:
-            if i == retries - 1:
-                df = pd.DataFrame(columns=BASE_COLUMNS)
-            else:
-                time.sleep(delay)
-    for c in BASE_COLUMNS:
-        if c not in df.columns: df[c] = ""
-    return df
+def utcnow():
+    return datetime.now(timezone.utc)
 
-def save_df(df: pd.DataFrame):
-    save_df_atomic(df, CSV_PATH)
-
-# ---------- Utilities ----------
-def sha16(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-def row_id(r: Dict) -> str:
-    return sha16(f"{r.get('title','')}|{r.get('link','')}")
-
-def normalize_date_str(s: Optional[str]) -> Optional[str]:
-    if not s or str(s).strip() == "":
+def parse_utc(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
         return None
     try:
-        dt = dateparse.parse(str(s), dayfirst=True, fuzzy=True)
-        return dt.date().isoformat()
+        # supports "2025-09-03T01:23:45Z" and similar
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     except Exception:
         return None
 
-def safe_get(url: str, timeout=20) -> Optional[str]:
+@st.cache_data(ttl=60)
+def get_last_run() -> Optional[datetime]:
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "GrantFinderBot/1.0"})
-        if r.ok:
-            return r.text
+        res = sb.table("meta").select("value").eq("key", "last_run_utc").limit(1).execute()
+        rows = getattr(res, "data", []) or []
+        if rows and rows[0].get("value"):
+            return parse_utc(rows[0]["value"])
     except Exception:
         pass
     return None
 
-def first_text(soup: BeautifulSoup, selectors: list[str]) -> str:
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            t = el.get_text(" ", strip=True)
-            if t:
-                return t
-    return ""
+@st.cache_data(ttl=60)
+def fetch_grants_for(slug: str, include_statewide: bool) -> pd.DataFrame:
+    """Fetch grants for a single council; optionally union statewide rows."""
+    chunks: List[pd.DataFrame] = []
 
-def meta_content(soup: BeautifulSoup) -> str:
-    for name in ["description", "og:description"]:
-        el = soup.select_one(f'meta[name="{name}"], meta[property="{name}"]')
-        if el and el.get("content"):
-            return el.get("content").strip()
-    return ""
-
-AMOUNT_RX = re.compile(r"\$\s?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\$\s?\d+[KkMm]?", re.I)
-DEADLINE_RX = re.compile(r"(deadline|close[s]?|closing date|apply by)\s*[:\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", re.I)
-
-def extract_amount(text: str) -> str:
-    m = AMOUNT_RX.search(text or "")
-    return m.group(0) if m else ""
-
-def extract_deadline(text: str) -> str:
-    m = DEADLINE_RX.search(text or "")
-    return m.group(0) if m else ""
-
-def fetch_detail(link: str) -> dict:
-    """Fetch detail page to enrich title/description/amount/deadline."""
-    html = safe_get(link)
-    if not html:
-        return {}
-    s = BeautifulSoup(html, "html.parser")
-    title = first_text(s, ["h1", "h2"]) or ""
-    meta = meta_content(s)
-    desc = meta or first_text(s, ["article p", "main p", ".content p", ".rich-text p", "p"])
-    gist = f"{title} {desc}"
-    return {
-        "title": (title or "").strip(),
-        "description": (desc or "").strip(),
-        "amount": extract_amount(gist),
-        "deadline": extract_deadline(gist),
-    }
-
-def ai_summarize(title: str, description: str) -> str:
-    if not (OPENAI_API_KEY and SUMMARIZE):
-        return ""
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = (
-            "Summarize this grant in 2 short sentences for council officers. "
-            "Include who it’s for and the key benefit. Avoid fluff.\n\n"
-            f"Title: {title}\nDescription: {description[:1500]}"
-        )
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=140,
-        )
-        return (r.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
-
-# ---------- Scraper ----------
-KEYWORDS = ("grant", "fund", "funding", "program", "round", "apply")
-
-def near_text(el: BeautifulSoup, selector: str) -> str:
-    n = el.find_next(selector)
-    return (n.get_text(" ", strip=True) if n else "")[:600]
-
-def parse_generic(html: str, base_url: str) -> List[Dict]:
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    candidates = []
-
-    for a in soup.select("a"):
-        title = (a.get_text() or "").strip()
-        href = (a.get("href") or "").strip()
-        if not title or not href:
-            continue
-        low = title.lower()
-        if not any(k in low for k in KEYWORDS) and ("grant" not in href.lower() and "fund" not in href.lower()):
-            continue
-
-        link = href if href.startswith("http") else urljoin(base_url, href)
-        desc = near_text(a, "p") or near_text(a, "li")
-        candidates.append({
-            "title": title,
-            "description": desc,
-            "amount": "",
-            "deadline": "",
-            "link": link,
-            "source": base_url,
-            "summary": "",
-        })
-
-    # de-dup by link
-    seen, rows = set(), []
-    for r in candidates:
-        L = r["link"]
-        if L not in seen:
-            seen.add(L); rows.append(r)
-
-    # follow up to FOLLOW_DETAILS detail pages to enrich
-    for r in rows[:max(0, FOLLOW_DETAILS)]:
+    def _fetch(sl: str) -> Optional[pd.DataFrame]:
         try:
-            detail = fetch_detail(r["link"])
-            if detail.get("title"): r["title"] = detail["title"]
-            if detail.get("description"): r["description"] = detail["description"]
-            if detail.get("amount"): r["amount"] = detail["amount"]
-            if not r["deadline"] and detail.get("deadline"): r["deadline"] = detail["deadline"]
-            # optional AI summary
-            summ = ai_summarize(r["title"], r["description"])
-            if summ: r["summary"] = summ
-            time.sleep(0.2)  # be polite
+            res = (
+                sb.table("grants")
+                .select(
+                    "id,title,description,amount,deadline,deadline_iso,link,source,summary,created_at,council_slug"
+                )
+                .eq("council_slug", sl)
+                .order("created_at", desc=True)
+                .limit(2000)
+                .execute()
+            )
+            data = getattr(res, "data", []) or []
+            if not data:
+                return None
+            df = pd.DataFrame(data)
+            return df
         except Exception:
-            pass
+            return None
 
-    return rows
+    df_slug = _fetch(slug)
+    if df_slug is not None:
+        chunks.append(df_slug)
 
-def scrape_sources(sources: List[str]) -> List[Dict]:
-    results = []
-    for src in sources:
-        html = safe_get(src)
-        results.extend(parse_generic(html, src))
-        time.sleep(0.3)
-    # de-dup across sources
-    seen, keep = set(), []
-    for r in results:
-        L = r.get("link","")
-        if L and L not in seen:
-            seen.add(L); keep.append(r)
-    return keep
+    if include_statewide and slug != STATEWIDE_SLUG:
+        df_state = _fetch(STATEWIDE_SLUG)
+        if df_state is not None:
+            chunks.append(df_state)
 
-# ---------- Merge ----------
-def merge_into_csv(new_rows: List[Dict]) -> int:
-    if not new_rows: return 0
-    df = load_df()
-    existing_links = set(df["link"].fillna("").astype(str).tolist()) if not df.empty else set()
-    to_add = []
-    for r in new_rows:
-        link = r.get("link","")
-        if not link or link in existing_links: continue
-        item = r.copy()
-        item["id"] = row_id(item)
-        item["created_at"] = datetime.utcnow().isoformat() + "Z"  # UTC mark
-        iso = normalize_date_str(item.get("deadline"))
-        item["deadline"] = iso or (item.get("deadline") or "")
-        # ensure summary present (could be empty if toggles off)
-        item["summary"] = item.get("summary","")
-        to_add.append(item)
-    if not to_add: return 0
-    df2 = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True) if not df.empty else pd.DataFrame(to_add)
-    save_df(df2)
-    return len(to_add)
+    if not chunks:
+        return pd.DataFrame(columns=["title", "amount", "deadline", "deadline_iso", "link", "source", "summary", "created_at", "council_slug"])
 
-# ---------- UI ----------
-st.set_page_config(page_title=f"{APP_NAME} — {TENANT_NAME}", page_icon="🏛️", layout="wide")
-st.markdown(f"<style>:root {{ --brand: {THEME_COLOR}; }}</style>", unsafe_allow_html=True)
-st.title(f"🏛️ GrantFinder — {TENANT_NAME}")
-st.caption(f"🎯 Victoria (AU) • Tenant: **{slug}** • Data: `{TENANT_DIR}` • FOLLOW_DETAILS={FOLLOW_DETAILS} • SUMMARIZE={'on' if SUMMARIZE else 'off'}")
+    df = pd.concat(chunks, ignore_index=True)
 
-if st.button("🔄 Refresh grants"):
-    with st.spinner("Scraping tenant sources…"):
-        added = merge_into_csv(scrape_sources(SOURCES))
-    st.success(f"✅ Added {added} new grants.")
+    # Normalize times & compute flags
+    df["_created_dt"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
+    df["_deadline_dt"] = pd.to_datetime(df["deadline_iso"], utc=True, errors="coerce")
 
-ensure_csv()
-df = load_df()
-if df.empty:
-    st.info("No grants yet. Click **Refresh grants** above to load data.")
-else:
-    last = df["created_at"].max()
-    df["_created_dt"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
-    now_utc = pd.Timestamp.now(tz="UTC"); yesterday = now_utc - pd.Timedelta(days=1)
-    new_24h = df[df["_created_dt"] >= yesterday]
-    st.caption(f"🆕 {len(new_24h)} new in last 24h • Total {len(df)} • Last refresh: {last}")
-
-# -------- Filters --------
-st.subheader("🔎 Browse & filter")
-c1, c2, c3 = st.columns([2,1,1])
-with c1:
-    q = st.text_input("Keyword", placeholder="e.g., youth, environment, arts…").strip().lower()
-with c2:
-    min_amount_text = st.text_input("Min amount (text search)", placeholder="$10,000")
-with c3:
-    deadline_before = st.date_input("Deadline before (optional)", value=None)
-
-show_summary = st.toggle("Show AI summary column", value=True)
-
-filtered = df.copy()
-if not filtered.empty:
-    filtered["deadline_iso"] = filtered["deadline"].apply(normalize_date_str)
-    filtered["_deadline_dt"] = pd.to_datetime(filtered["deadline_iso"], errors="coerce")
-
-    if q:
-        mask = (
-            filtered["title"].fillna("").str.lower().str.contains(q, na=False) |
-            filtered["description"].fillna("").str.lower().str.contains(q, na=False) |
-            filtered["summary"].fillna("").str.lower().str.contains(q, na=False)
-        )
-        filtered = filtered[mask]
-
-    if min_amount_text:
-        mask_amt = (
-            filtered["amount"].fillna("").astype(str).str.contains(min_amount_text, case=False, na=False) |
-            filtered["description"].fillna("").astype(str).str.contains(min_amount_text, case=False, na=False)
-        )
-        filtered = filtered[mask_amt]
-
-    if isinstance(deadline_before, date):
-        filtered = filtered[(filtered["_deadline_dt"].notna()) & (filtered["_deadline_dt"].dt.date <= deadline_before)]
-
-    filtered = filtered.sort_values(by=["_deadline_dt", "created_at"], ascending=[True, False], na_position="last").copy()
-
-    # Presentation frame (no duplicate column names)
-    def tidy(s: str, n: int = 180) -> str:
-        s = (s or "").strip().replace("\n"," ")
-        return (s[:n] + "…") if len(s) > n else s
-
-    filtered["description_preview"] = filtered["description"].fillna("").apply(tidy)
-    filtered["summary_preview"] = filtered["summary"].fillna("").apply(lambda x: tidy(x, 220))
-    filtered["title_link"] = filtered["link"].fillna("")
-
-    cols = ["title","title_link","amount","deadline_iso","source","description_preview"]
-    if show_summary:
-        cols.append("summary_preview")
-
-    display_df = filtered[cols].copy()
-
-    st.write(f"Showing **{len(display_df)}** grants")
-    column_config = {
-        "title": st.column_config.TextColumn("title", width="medium"),
-        "title_link": st.column_config.LinkColumn("open", display_text="Open"),
-        "amount": st.column_config.TextColumn("amount", width="small"),
-        "deadline_iso": st.column_config.TextColumn("deadline", width="small"),
-        "source": st.column_config.LinkColumn("source", display_text="Source"),
-        "description_preview": st.column_config.TextColumn("description", width="large"),
-    }
-    if show_summary:
-        column_config["summary_preview"] = st.column_config.TextColumn("AI summary", width="large")
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config=column_config
+    now_utc = pd.Timestamp.utcnow()
+    df["status"] = df["_deadline_dt"].apply(
+        lambda d: "Open" if (pd.isna(d) or d >= now_utc) else "Closed"
+    )
+    df["new_24h"] = df["_created_dt"].apply(
+        lambda d: bool(pd.notna(d) and d >= (now_utc - pd.Timedelta(days=1)))
     )
 
-    # Export current view
-    export_cols = ["title","amount","deadline","source","link","description","summary"]
-    filtered["deadline"] = filtered["deadline_iso"]
-    csv_bytes = filtered[export_cols].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Export CSV", data=csv_bytes, file_name=f"grants_{slug}.csv", mime="text/csv")
-else:
-    st.write("Showing **0** grants")
-    st.download_button("⬇️ Export CSV",
-                       data=b"title,amount,deadline,source,link,description,summary\n",
-                       file_name=f"grants_{slug}.csv",
-                       mime="text/csv")
+    # Ensure consistent, unique columns
+    keep_cols = [
+        "title", "amount", "deadline", "deadline_iso",
+        "status", "new_24h", "link", "source", "summary",
+        "created_at", "council_slug"
+    ]
+    existing = [c for c in keep_cols if c in df.columns]
+    df = df[existing].copy()
 
-st.divider()
-st.caption("ⓘ Data is best-effort from public pages. Always verify on the source site before applying.")
+    return df
+
+def ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Streamlit/pyarrow errors if duplicate column names exist."""
+    seen = {}
+    new_cols = []
+    for c in df.columns:
+        if c not in seen:
+            seen[c] = 1
+            new_cols.append(c)
+        else:
+            seen[c] += 1
+            new_cols.append(f"{c}_{seen[c]}")
+    df.columns = new_cols
+    return df
+
+def council_options() -> List[str]:
+    return list(TENANTS.keys())
+
+def council_name(slug: str) -> str:
+    cfg = TENANTS.get(slug) or {}
+    return cfg.get("name") or slug.title()
+
+def share_url_for(slug: str) -> str:
+    base = st.secrets.get("app_base_url", "") or os.getenv("APP_BASE_URL", "")
+    if not base:
+        # Fall back to building from current page
+        try:
+            # st.query_params works in modern Streamlit, fallback to experimental
+            qp = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+            # we can't get current base reliably server-side; just show relative
+            return f"/?c={slug}"
+        except Exception:
+            return f"/?c={slug}"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}c={slug}"
+
+# ---------- Refresh integration ----------
+def refresh_all_tenants_once() -> int:
+    """
+    Calls your refresh_supabase.py logic (scrape → upsert → meta).
+    Returns number of rows upserted (best-effort).
+    """
+    try:
+        import refresh_supabase as rs
+
+        total = 0
+        for slug, cfg in (rs.TENANTS or {}).items():
+            srcs = (cfg or {}).get("sources", []) or []
+            rows = rs.scrape_sources(srcs)
+            total += rs.upsert_grants(rows, slug)
+        rs.set_last_run()
+        return total
+    except Exception as e:
+        # If the module isn't present or anything fails, don't crash the app.
+        print("refresh_all_tenants_once() failed:", e)
+        return -1
+
+# ---------- Optional Cron endpoint ----------
+def _get_qp(key: str) -> Optional[str]:
+    try:
+        qp = st.query_params  # Streamlit >= 1.34
+        v = qp.get(key)
+        return v[0] if isinstance(v, list) else v
+    except Exception:
+        v = st.experimental_get_query_params().get(key, [None])[0]
+        return v
+
+def maybe_handle_cron():
+    if not CRON_TOKEN:
+        return
+    cron = _get_qp("cron")
+    if cron and cron == CRON_TOKEN:
+        with st.spinner("Cron refresh in progress…"):
+            added = refresh_all_tenants_once()
+        st.write(f"OK • refreshed all tenants • added {added} items")
+        st.stop()
+
+# ================== UI START ==================
+st.set_page_config(page_title="GrantFinder (VIC)", page_icon="🗂️", layout="wide")
+maybe_handle_cron()
+
+st.title("GrantFinder — Victoria (Councils)")
+st.caption("Auto-aggregated grants from council & state sources. Supabase-backed. 🐨")
+
+# Sidebar: council selection
+with st.sidebar:
+    st.header("Filters")
+    slugs = council_options()
+    # Prefer a query param ?c=slug
+    slug_from_qp = _get_qp("c")
+    default_slug = slug_from_qp if slug_from_qp in slugs else ( "wyndham" if "wyndham" in slugs else slugs[0] )
+    slug = st.selectbox("Council", options=slugs, index=slugs.index(default_slug))
+    st.write(f"Viewing: **{council_name(slug)}**")
+    st.write("Share this council:")
+    st.code(share_url_for(slug), language="text")
+
+    include_statewide = INCLUDE_STATEWIDE_IN_EACH and st.toggle(
+        "Include statewide grants", value=True, help="Also include state-wide VIC grants alongside this council."
+    )
+
+    search = st.text_input("Search (title/description)", placeholder="e.g. youth sport equipment")
+    status_filter = st.multiselect("Status", ["Open", "Closed"], default=["Open"])
+    show_new_only = st.toggle("Only ‘new in last 24h’", value=False)
+
+# Auto-refresh gate (free, no worker)
+last_run = get_last_run()
+needs_refresh = (
+    last_run is None or (utcnow() - last_run) > timedelta(minutes=AUTO_REFRESH_MAX_AGE_MIN)
+)
+
+colA, colB, colC, colD = st.columns([1,1,1,1])
+with colA:
+    st.metric("Auto-refresh window (min)", AUTO_REFRESH_MAX_AGE_MIN)
+with colB:
+    st.metric("Last refresh (UTC)", last_run.isoformat() if last_run else "—")
+with colC:
+    st.write("")
+    if st.button("🔄 Refresh now"):
+        with st.spinner("Refreshing all councils…"):
+            added = refresh_all_tenants_once()
+        st.success(f"Done. Added/upserted ~{added} rows (best-effort).")
+        # Invalidate caches so latest shows
+        get_last_run.clear()
+        fetch_grants_for.clear()
+with colD:
+    st.write("")
+    if st.button("♻️ Force auto-refresh if stale"):
+        if needs_refresh:
+            with st.spinner("Auto-refresh kick…"):
+                added = refresh_all_tenants_once()
+            st.success(f"Auto-refresh complete (added ~{added}).")
+            get_last_run.clear()
+            fetch_grants_for.clear()
+        else:
+            st.info("Data is fresh enough; no refresh needed.")
+
+if needs_refresh:
+    st.info("Data is older than the refresh window. Click **Refresh now** above, or enable a cron ping (see README).")
+
+# Fetch data
+with st.spinner("Loading grants…"):
+    df = fetch_grants_for(slug, include_statewide)
+    if not df.empty:
+        if search:
+            s = search.strip().lower()
+            mask = (
+                df["title"].fillna("").str.lower().str.contains(s)
+                | df["description"].fillna("").str.lower().str.contains(s)
+                | df.get("summary", pd.Series([""]*len(df))).fillna("").str.lower().str.contains(s)
+            )
+            df = df[mask]
+
+        if status_filter:
+            df = df[df["status"].isin(status_filter)]
+
+        if show_new_only:
+            df = df[df["new_24h"] == True]
+
+        # Sort: open first, then by created_at desc (fallback)
+        created_dt = pd.to_datetime(df.get("created_at"), utc=True, errors="coerce")
+        df = df.assign(_sort_open=(df["status"] != "Open").astype(int), _created_dt=created_dt)
+        df = df.sort_values(by=["_sort_open", "_created_dt"], ascending=[True, False])
+
+        # Humanized columns
+        df_show = df.copy()
+        df_show.rename(
+            columns={
+                "title": "Title",
+                "amount": "Amount",
+                "deadline": "Deadline (text)",
+                "deadline_iso": "Deadline (ISO)",
+                "status": "Status",
+                "new_24h": "🆕 24h",
+                "link": "Link",
+                "source": "Source",
+                "summary": "AI Summary",
+                "created_at": "Discovered At (UTC)",
+                "council_slug": "Council",
+            },
+            inplace=True,
+        )
+
+        # Remove helper cols if they slipped in
+        for c in ["_sort_open", "_created_dt"]:
+            if c in df_show.columns:
+                df_show.drop(columns=[c], inplace=True, errors="ignore")
+
+        # Ensure unique names (Streamlit/pyarrow quirk protection)
+        df_show = ensure_unique_columns(df_show)
+
+        # KPIs
+        total = len(df_show)
+        new24 = int((df["new_24h"] == True).sum())
+        open_ct = int((df["status"] == "Open").sum())
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total shown", total)
+        m2.metric("Open", open_ct)
+        m3.metric("New in last 24h", new24)
+
+        # Export
+        csv_buf = StringIO()
+        df_show.to_csv(csv_buf, index=False)
+        st.download_button("⬇️ Export CSV", data=csv_buf.getvalue(), file_name=f"grants_{slug}.csv", mime="text/csv")
+
+        # Data table with link columns
+        st.dataframe(
+            df_show,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Link": st.column_config.LinkColumn("Link"),
+                "Source": st.column_config.LinkColumn("Source"),
+                "🆕 24h": st.column_config.CheckboxColumn("🆕 24h"),
+            },
+        )
+    else:
+        st.warning("No grants found yet for this council. Try **Refresh now** or check your tenant sources.")
+
+# Help / FAQ
+with st.expander("What makes this useful to councils?"):
+    st.markdown("""
+- **One place** for all grant opportunities (council sites + state pages).
+- **De-duplicated** links and **fast search** across titles/descriptions.
+- **Auto-refresh** (no manual copying) + optional **hourly cron**.
+- Optional **AI summaries** (set `SUMMARIZE=1` + `OPENAI_API_KEY`) to give who/why in 2 sentences.
+- Shareable deep links like `/?c=wyndham` for each council.
+""")
+
+with st.expander("How do I keep it fresh without paying for a worker?"):
+    st.markdown("""
+- Set `AUTO_REFRESH_MAX_AGE_MIN` (e.g., 60) to let the app refresh on first visit.
+- Or set `CRON_TOKEN` and ping `/?cron=TOKEN` hourly with UptimeRobot (free).
+- Or use the free GitHub Actions workflow to run `refresh_supabase.py` hourly.
+""")
