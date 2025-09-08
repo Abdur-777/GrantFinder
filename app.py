@@ -6,55 +6,28 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
-
-# ---------- Config & Clients ----------
-from supabase import create_client
-import yaml
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-TENANTS_FILE = os.getenv("TENANTS_FILE", "tenants.yaml")
-INCLUDE_STATEWIDE_IN_EACH = os.getenv("INCLUDE_STATEWIDE_IN_EACH", "1") == "1"
-STATEWIDE_SLUG = os.getenv("STATEWIDE_SLUG", "vic")
-AUTO_REFRESH_MAX_AGE_MIN = int(os.getenv("AUTO_REFRESH_MAX_AGE_MIN", "60"))
-CRON_TOKEN = os.getenv("CRON_TOKEN", "")
-SUMMARIZE = os.getenv("SUMMARIZE", "0") == "1"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# ---------- Utils ----------
-def load_tenants() -> Dict[str, dict]:# app.py
-import os
-from datetime import datetime, timedelta, timezone
-from io import StringIO
-from typing import Dict, List, Optional
-
-import pandas as pd
-import streamlit as st
 from supabase import create_client
 import yaml
 
 # ----------------- Secrets / Config -----------------
 def require_secret(key: str, hint: str = "") -> str:
-    val = os.getenv(key) or st.secrets.get(key)
+    val = os.getenv(key) or (st.secrets.get(key) if hasattr(st, "secrets") else None)
     if not val:
         st.error(
             f"Missing required secret `{key}`.\n\n"
-            f"Set it in Render → your Web Service → Environment → Add:\n`{key}`.\n{hint}"
+            f"Set it in Render → your Web Service → Environment → Add: `{key}`.\n{hint}"
         )
         st.stop()
     return val
 
 SUPABASE_URL = require_secret(
     "SUPABASE_URL",
-    "Supabase → Settings → API → Project URL (looks like https://xxxx.supabase.co)."
+    "Supabase → Settings → API → Project URL (looks like https://xxxx.supabase.co).",
 )
 SUPABASE_KEY = require_secret(
     "SUPABASE_SERVICE_KEY",
-    "Supabase → Settings → API → Service role key (NOT the anon key)."
+    "Supabase → Settings → API → Service role key (NOT the anon key).",
 )
-
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TENANTS_FILE = os.getenv("TENANTS_FILE", "tenants.yaml")
@@ -62,7 +35,7 @@ INCLUDE_STATEWIDE_IN_EACH = os.getenv("INCLUDE_STATEWIDE_IN_EACH", "1") == "1"
 STATEWIDE_SLUG = os.getenv("STATEWIDE_SLUG", "vic")
 AUTO_REFRESH_MAX_AGE_MIN = int(os.getenv("AUTO_REFRESH_MAX_AGE_MIN", "60"))
 CRON_TOKEN = os.getenv("CRON_TOKEN", "")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "") or st.secrets.get("app_base_url", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "") or (st.secrets.get("app_base_url", "") if hasattr(st, "secrets") else "")
 SUMMARIZE = os.getenv("SUMMARIZE", "0") == "1"  # read-only here; scraper populates summaries
 
 # ----------------- Helpers -----------------
@@ -74,7 +47,7 @@ def load_tenants() -> Dict[str, dict]:
                 return data
     except Exception as e:
         st.warning(f"Could not read {TENANTS_FILE}: {e}")
-    # minimal fallback
+    # Fallback
     return {
         STATEWIDE_SLUG: {
             "name": "Victoria — Statewide",
@@ -95,16 +68,17 @@ def parse_utc(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
     try:
-        # handles ...Z and +00:00
         return datetime.fromisoformat(str(dt_str).replace("Z", "+00:00"))
     except Exception:
         return None
 
 def get_qp(key: str) -> Optional[str]:
     try:
-        qp = st.query_params
+        qp = st.query_params  # Streamlit >= 1.34
         v = qp.get(key)
-        return v[0] if isinstance(v, list) else v
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
     except Exception:
         return st.experimental_get_query_params().get(key, [None])[0]
 
@@ -152,12 +126,13 @@ def fetch_grants_for(slug: str, include_statewide: bool) -> pd.DataFrame:
     if include_statewide and slug != STATEWIDE_SLUG:
         frames.append(_fetch(STATEWIDE_SLUG))
 
-    df = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(not f.empty for f in frames) else pd.DataFrame()
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
 
-    if df.empty:
-        return df
+    df = pd.concat(frames, ignore_index=True)
 
-    # Normalize datetimes — make both sides tz-aware UTC to avoid TypeErrors
+    # Normalize datetimes (tz-aware UTC)
     df["_created_dt"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
     df["_deadline_dt"] = pd.to_datetime(df["deadline_iso"], utc=True, errors="coerce")
 
@@ -165,7 +140,7 @@ def fetch_grants_for(slug: str, include_statewide: bool) -> pd.DataFrame:
     df["Status"] = df["_deadline_dt"].apply(lambda d: "Open" if (pd.isna(d) or d >= now_utc) else "Closed")
     df["🆕 24h"] = df["_created_dt"].apply(lambda d: bool(pd.notna(d) and d >= (now_utc - pd.Timedelta(days=1))))
 
-    # Build a clean, no-duplicate column set for display/export
+    # Clean display set
     cols = [
         "title", "description", "amount",
         "deadline", "deadline_iso",
@@ -173,11 +148,12 @@ def fetch_grants_for(slug: str, include_statewide: bool) -> pd.DataFrame:
         "link", "source",
         "summary",
         "created_at", "council_slug",
+        "_created_dt",
     ]
     existing = [c for c in cols if c in df.columns]
-    df = df[existing + ["_created_dt"]].copy()
+    df = df[existing].copy()
 
-    # Human-friendly names
+    # Friendly names
     rename_map = {
         "title": "Title",
         "description": "Description",
@@ -192,21 +168,22 @@ def fetch_grants_for(slug: str, include_statewide: bool) -> pd.DataFrame:
     }
     df.rename(columns=rename_map, inplace=True)
 
-    # Sort: Open first, then latest discovered
-    df.sort_values(by=["Status", "_created_dt"], ascending=[True, False], inplace=True)
-    df.drop(columns=["_created_dt"], inplace=True, errors="ignore")
+    # Sort: Open first, then newest discovered
+    df["_sort_open"] = (df["Status"] != "Open").astype(int)
+    df.sort_values(by=["_sort_open", "_created_dt"], ascending=[True, False], inplace=True)
+    df.drop(columns=["_sort_open", "_created_dt"], inplace=True, errors="ignore")
 
-    # Ensure unique names (guard against accidental dupes)
+    # Ensure unique column names (Streamlit/pyarrow quirk)
     seen = {}
-    final_cols = []
+    new_cols = []
     for c in df.columns:
         if c not in seen:
             seen[c] = 1
-            final_cols.append(c)
+            new_cols.append(c)
         else:
             seen[c] += 1
-            final_cols.append(f"{c}_{seen[c]}")
-    df.columns = final_cols
+            new_cols.append(f"{c}_{seen[c]}")
+    df.columns = new_cols
 
     return df
 
@@ -252,10 +229,9 @@ with st.sidebar:
     st.header("Filters")
     slugs = council_options()
     slug_from_qp = get_qp("c")
-    default_slug = slug_from_qp if slug_from_qp in slugs else ( "wyndham" if "wyndham" in slugs else slugs[0] )
+    default_slug = slug_from_qp if slug_from_qp in slugs else ("wyndham" if "wyndham" in slugs else slugs[0])
     slug = st.selectbox("Council", options=slugs, index=slugs.index(default_slug))
     st.write(f"Viewing: **{council_name(slug)}**")
-
     st.write("Share this view:")
     st.code(share_url_for(slug), language="text")
 
@@ -298,21 +274,17 @@ else:
     # Filters
     work = df.copy()
 
-    # Apply search
     if query:
         q = query.strip().lower()
-        # defensively pull columns if renamed or missing
-        t = work.get("Title", pd.Series([""]*len(work))).fillna("").str.lower()
-        d = work.get("Description", pd.Series([""]*len(work))).fillna("").str.lower()
-        s = work.get("AI Summary", pd.Series([""]*len(work))).fillna("").str.lower()
+        t = work.get("Title", pd.Series([""] * len(work))).fillna("").str.lower()
+        d = work.get("Description", pd.Series([""] * len(work))).fillna("").str.lower()
+        s = work.get("AI Summary", pd.Series([""] * len(work))).fillna("").str.lower()
         mask = t.str.contains(q) | d.str.contains(q) | s.str.contains(q)
         work = work[mask]
 
-    # Status filter
     if status_sel and "Status" in work.columns:
         work = work[work["Status"].isin(status_sel)]
 
-    # New 24h filter
     if only_new and "🆕 24h" in work.columns:
         work = work[work["🆕 24h"] == True]
 
@@ -333,7 +305,7 @@ else:
         "⬇️ Export CSV",
         data=csv_buf.getvalue(),
         file_name=f"grants_{slug}.csv",
-        mime="text/csv"
+        mime="text/csv",
     )
 
     # Data table
@@ -345,12 +317,7 @@ else:
     if "🆕 24h" in work.columns:
         col_cfg["🆕 24h"] = st.column_config.CheckboxColumn("🆕 24h")
 
-    st.dataframe(
-        work,
-        use_container_width=True,
-        hide_index=True,
-        column_config=col_cfg
-    )
+    st.dataframe(work, use_container_width=True, hide_index=True, column_config=col_cfg)
 
 # FAQ / Help
 with st.expander("How do I keep data fresh without paying for a worker?"):
@@ -366,5 +333,5 @@ with st.expander("What makes this useful to councils?"):
 - **Fast search** across title/description/summary.
 - **Open/Closed + new in 24h** flags to triage quickly.
 - **Shareable deep-links** like `/?c=wyndham` for each council.
-- Optional **AI summaries** when your scraper follows details (set `SUMMARIZE=1` + `OPENAI_API_KEY`).
+- Optional **AI summaries** when your scraper follows details (`SUMMARIZE=1` + `OPENAI_API_KEY`).
 """)
